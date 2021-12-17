@@ -1,0 +1,1439 @@
+with total_ as 
+(select 
+	distinct 
+	local_date,
+	count(chat_id) over (partition by local_date) as daily_total,
+	date(date_trunc('week',local_date)) as week_date,
+	count(chat_id) over (partition by date(date_trunc('week',local_date))) as weekly_total,
+	date(date_trunc('month',local_date)) as month_date,
+	count(chat_id) over (partition by date(date_trunc('month',local_date))) as monthly_total
+from (
+select 
+		distinct
+		livechat_chat_operators.chat_id,
+		start_timestamp + '8:00' as local_timestamp,
+		left((start_timestamp + '8:00')::varchar,10)::date as local_date
+	from livechat_chat_operators 
+	left join livechat_chat_insights
+	on livechat_chat_operators.chat_id = livechat_chat_insights.chat_id
+) a )
+, sub_null_to_zero  as (
+select 
+		local_date_created,
+		agent_name as assignee_id,
+		email_address,
+		case 
+			when mc_count is null 
+			then 0 
+			else mc_count
+		end as mc_count,
+		daily_total,
+		weekly_total,
+		monthly_total,
+		cx_name
+	from 
+		(
+			select 
+				local_date_created,
+				agent_name,
+				email_address,
+				sum_daily,
+				mc_count,
+				cx_name
+			from (
+			select 
+				distinct 
+				local_date_created,
+				agent_name,
+				email_address,
+				count(daily_chats) over (partition by local_date_created, agent_name,email_address) as sum_daily
+			from 
+			(
+				select 
+					left(local_timestamp::varchar,10)::date as local_date_created,
+					display_name as agent_name,
+					email as email_address,
+					count(*) over (partition by chat_id,display_name,email) as daily_chats
+				from 
+				(
+				select 
+					chat_id,
+					display_name,
+					email,
+					timestamp+'8:00' as local_timestamp
+				from livechat_chat_operators 
+				) a 
+			) a ) b
+			left join
+			(
+			select 
+				distinct
+				local_date,
+				local_timestamp,
+				display_name,
+				email,
+				cx_name,
+				mc_count
+			from
+				(select 
+				*
+			from 
+			(select 
+				livechat_chat_operators.chat_id,
+				timestamp+'8:00' as local_timestamp,
+				left((timestamp+'8:00')::varchar,10)::date as local_date,
+				display_name,
+				email,
+				operators_count,
+				author_name as cx_name,
+				count(*) over (partition by chat_id, display_name) as mc_count
+			from 
+				livechat_chat_operators
+			join
+			(
+			select
+				distinct 
+				chat_id as q_id,
+				author_name
+			from 
+			(
+			select 
+				*,
+				max(message_count) over (partition by chat_id) as max_m 
+			from 
+				livechat_chat_messages
+			) a 
+			where 
+				max_m = message_count 
+				and user_type = 'visitor'
+				and message_text like '%?'
+			) a 
+			on chat_id = q_id
+			where email like '%boldr%'
+			) a ) b ) c
+			on local_date = local_date_created and display_name = agent_name
+		) as check_livechat
+		left join total_ on local_date = local_date_created 
+)
+,
+duplicates as (
+select 
+	distinct
+	local_date_created,
+	job_effectivity_date,
+	assignee_id,
+	email_address,
+	full_name as agent_name,
+	job_supervisor as supervisor,
+	mc_count,
+	daily_total,
+	weekly_total,
+	monthly_total,
+--	mc_count::float/daily_total as mc_score,
+	local_date_created - job_effectivity_date as recent,
+	min(local_date_created - job_effectivity_date) over (partition by local_date_created, assignee_id) as recent_
+from 
+	sub_null_to_zero
+left join
+(
+	select 
+		distinct
+		agent_name as full_name,
+		job_supervisor,
+		job_effectivity_date,
+		email_address as email
+	from 
+		sd_hris_team_roster
+	join
+		sd_agent_roster
+		on concat(first_name,' ',last_name) = agent_name
+	where 
+		job_division = 'Brooklinen'
+		and crm_tool = 'livechat'
+) a
+on email = email_address and job_effectivity_date < local_date_created
+where 
+	full_name is not null
+order by 
+	local_date_created
+)
+--select * from duplicates
+,
+raw_breakdown as (
+select
+	distinct
+	local_date_created,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,	
+	mc_count,
+	daily_total,
+	sum(mc_count) over (partition by local_date_created) as mc_team,
+	avg(daily_total) over (partition by local_date_created) as sum_team,
+	sum(mc_count) over (partition by local_date_created, supervisor) as mc_visor,
+	avg(daily_total) over (partition by local_date_created, supervisor) as sum_visor,
+	date(date_trunc('week', local_date_created)) as week_date,
+	sum(mc_count) over (partition by date(date_trunc('week', local_date_created)), agent_name) as mc_week,
+	avg(weekly_total) over (partition by date(date_trunc('week', local_date_created)), agent_name) as sum_week,
+	sum(mc_count) over (partition by date(date_trunc('week', local_date_created))) as mc_team_week,
+	avg(weekly_total) over (partition by date(date_trunc('week', local_date_created))) as sum_team_week,
+	sum(mc_count) over (partition by date(date_trunc('week', local_date_created)), supervisor) as mc_visor_week,
+	avg(weekly_total) over (partition by date(date_trunc('week', local_date_created)), supervisor) as sum_visor_week,
+	date(date_trunc('month', local_date_created)) as month_date,
+	sum(mc_count) over (partition by date(date_trunc('month', local_date_created)), agent_name) as mc_month,
+	avg(monthly_total) over (partition by date(date_trunc('month', local_date_created)), agent_name) as sum_month,
+	sum(mc_count) over (partition by date(date_trunc('month', local_date_created))) as mc_team_month,
+	avg(monthly_total) over (partition by date(date_trunc('month', local_date_created))) as sum_team_month,
+	sum(mc_count) over (partition by date(date_trunc('month', local_date_created)), supervisor) as mc_visor_month,
+	avg(monthly_total) over (partition by date(date_trunc('month', local_date_created)), supervisor) as sum_visor_month	
+from duplicates 
+where 
+	recent = recent_
+order by 
+	local_date_created,
+	agent_name
+)
+,
+raw_score as (
+select 
+	local_date_created,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	mc_count::float/daily_total as daily,
+	mc_team::float/sum_team as daily_team,
+	mc_visor::float/sum_visor as daily_visor,
+	week_date,
+	mc_week::float/sum_week as weekly,
+	mc_team_week::float/sum_team_week as weekly_team,
+	mc_visor_week::float/sum_visor_week as weekly_visor,
+	month_date,
+	mc_month::float/sum_month as monthly,
+	mc_team_month::float/sum_team_month as monthly_team,
+	mc_visor_month::float/sum_visor_month as monthly_visor,
+	case 
+		when local_date_created <= (select (select end_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'chat' 
+	              			and kpi = 'missed_chat'
+	              			and metric='old'))
+		then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+				and channel = 'chat' 
+				and kpi = 'missed_chat' 
+				and metric = 'old')
+		when local_date_created >= (select (select start_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'chat' 
+	              			and kpi = 'missed_chat'
+	              			and metric='new'))
+	    then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+				and channel = 'chat' 
+				and kpi = 'missed_chat' 
+				and metric = 'new')
+	end as target,
+	(select weight 
+				from kpi_data_warehouse.sd_kpi_weights 
+				where client_account = 'brooklinen' 
+				and kpi = 'missed_chat' 
+				and channel = 'chat') 
+	as weight	
+from raw_breakdown
+)
+,
+final_monthly as (
+		select 
+			distinct 
+			'brooklinen' as client_account,
+			'monthly' as period,
+			month_date as local_date_created,
+			'chat' as channel,
+			'' as assignee_id,
+			email_address,	
+			agent_name,
+			supervisor,
+			'missed_chats_p' as kpi_metric,
+			monthly as score,	
+			target,
+			case 
+				when (target=0.12) and (monthly <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+					where km.rating = 5
+					and km.client_account = 'brooklinen'
+					and km.channel = 'chat'
+					and km.kpi = 'missed_chat'
+					and km.metric = 'old'))
+				then 5
+				when (target=0.12) and (monthly
+					between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+						where km.rating = 4
+						and km.client_account = 'brooklinen'
+						and km.channel = 'chat'
+						and km.kpi = 'missed_chat'
+						and metric = 'old')
+					and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+						where km.rating = 4 
+						and km.client_account = 'brooklinen' 
+						and km.channel = 'chat' 
+						and km.kpi = 'missed_chat'
+						and metric = 'old'))
+				then 4
+				when (target = 0.12) and (monthly
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'old') 
+		          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'old') )
+		      	then 3
+		      	when (target = 0.12) and (monthly
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 2 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'old') 
+		         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		         		where km.rating = 2 
+		         		and km.client_account = 'brooklinen' 
+		         		and km.channel = 'chat' 
+		         		and km.kpi = 'missed_chat'
+		         		and metric = 'old')) 
+		       	then 2
+		      	when (target = 0.12) and (monthly >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		      		where km.rating = 1 
+		      		and km.client_account = 'brooklinen' 
+		      		and km.channel = 'chat' 
+		      		and km.kpi = 'missed_chat'
+		      		and metric = 'old') )
+		        then 1
+				when (target = 0.05) and (monthly <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+					where km.rating = 5
+					and km.client_account = 'brooklinen'
+					and km.channel = 'chat'
+					and km.kpi = 'missed_chat'
+					and km.metric = 'new'))
+				then 5
+				when (target = 0.05) and (monthly
+					between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+						where km.rating = 4
+						and km.client_account = 'brooklinen'
+						and km.channel = 'chat'
+						and km.kpi = 'missed_chat'
+						and metric = 'new')
+					and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+						where km.rating = 4 
+						and km.client_account = 'brooklinen' 
+						and km.channel = 'chat' 
+						and km.kpi = 'missed_chat'
+						and metric = 'new'))
+				then 4
+				when (target = 0.05) and (monthly
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'new') 
+		          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'new') )
+		      	then 3
+		      	when (target = 0.05) and (monthly
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 2 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'new') 
+		         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		         		where km.rating = 2 
+		         		and km.client_account = 'brooklinen' 
+		         		and km.channel = 'chat' 
+		         		and km.kpi = 'missed_chat'
+		         		and metric = 'new')) 
+		       	then 2
+		      	when (target = 0.05) and (monthly >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		      		where km.rating = 1 
+		      		and km.client_account = 'brooklinen' 
+		      		and km.channel = 'chat' 
+		      		and km.kpi = 'missed_chat'
+		      		and metric = 'new')) 
+		        then 1        
+			end as rating,
+			weight
+		from raw_score
+)
+,
+final_daily as (
+select 
+			distinct 
+			'brooklinen' as client_account,
+			'daily' as period,
+			local_date_created,
+			'chat' as channel,
+			'' as assignee_id,
+			email_address,	
+			agent_name,
+			supervisor,
+			'missed_chats_p' as kpi_metric,
+			daily as score,	
+			target,
+			case 
+				when (target=0.12) and (daily <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+					where km.rating = 5
+					and km.client_account = 'brooklinen'
+					and km.channel = 'chat'
+					and km.kpi = 'missed_chat'
+					and km.metric = 'old'))
+				then 5
+				when (target=0.12) and (daily
+					between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+						where km.rating = 4
+						and km.client_account = 'brooklinen'
+						and km.channel = 'chat'
+						and km.kpi = 'missed_chat'
+						and metric = 'old')
+					and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+						where km.rating = 4 
+						and km.client_account = 'brooklinen' 
+						and km.channel = 'chat' 
+						and km.kpi = 'missed_chat'
+						and metric = 'old'))
+				then 4
+				when (target = 0.12) and (daily
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'old') 
+		          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'old') )
+		      	then 3
+		      	when (target = 0.12) and (daily
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 2 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'old') 
+		         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		         		where km.rating = 2 
+		         		and km.client_account = 'brooklinen' 
+		         		and km.channel = 'chat' 
+		         		and km.kpi = 'missed_chat'
+		         		and metric = 'old')) 
+		       	then 2
+		      	when (target = 0.12) and (daily >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		      		where km.rating = 1 
+		      		and km.client_account = 'brooklinen' 
+		      		and km.channel = 'chat' 
+		      		and km.kpi = 'missed_chat'
+		      		and metric = 'old') )
+		        then 1
+				when (target = 0.05) and (daily <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+					where km.rating = 5
+					and km.client_account = 'brooklinen'
+					and km.channel = 'chat'
+					and km.kpi = 'missed_chat'
+					and km.metric = 'new'))
+				then 5
+				when (target = 0.05) and (daily
+					between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+						where km.rating = 4
+						and km.client_account = 'brooklinen'
+						and km.channel = 'chat'
+						and km.kpi = 'missed_chat'
+						and metric = 'new')
+					and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+						where km.rating = 4 
+						and km.client_account = 'brooklinen' 
+						and km.channel = 'chat' 
+						and km.kpi = 'missed_chat'
+						and metric = 'new'))
+				then 4
+				when (target = 0.05) and (daily
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'new') 
+		          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'new') )
+		      	then 3
+		      	when (target = 0.05) and (daily
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 2 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'new') 
+		         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		         		where km.rating = 2 
+		         		and km.client_account = 'brooklinen' 
+		         		and km.channel = 'chat' 
+		         		and km.kpi = 'missed_chat'
+		         		and metric = 'new')) 
+		       	then 2
+		      	when (target = 0.05) and (daily >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		      		where km.rating = 1 
+		      		and km.client_account = 'brooklinen' 
+		      		and km.channel = 'chat' 
+		      		and km.kpi = 'missed_chat'
+		      		and metric = 'new')) 
+		        then 1        
+			end as rating,
+			weight
+		from raw_score
+)
+,
+final_team_daily as (
+select
+			distinct 
+			'brooklinen' as client_account,
+			'daily' as period,
+			local_date_created,
+			'chat' as channel,
+			'' as assignee_id,
+			'' as email_address,	
+			'Team Total' as agent_name,
+			'Team Total' as supervisor,
+			'missed_chats_p' as kpi_metric,
+			daily_team as score,	
+			target,
+			case 
+				when (target=0.12) and (daily_team <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+					where km.rating = 5
+					and km.client_account = 'brooklinen'
+					and km.channel = 'chat'
+					and km.kpi = 'missed_chat'
+					and km.metric = 'old'))
+				then 5
+				when (target=0.12) and (daily_team
+					between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+						where km.rating = 4
+						and km.client_account = 'brooklinen'
+						and km.channel = 'chat'
+						and km.kpi = 'missed_chat'
+						and metric = 'old')
+					and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+						where km.rating = 4 
+						and km.client_account = 'brooklinen' 
+						and km.channel = 'chat' 
+						and km.kpi = 'missed_chat'
+						and metric = 'old'))
+				then 4
+				when (target = 0.12) and (daily_team
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'old') 
+		          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'old') )
+		      	then 3
+		      	when (target = 0.12) and (daily_team
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 2 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'old') 
+		         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		         		where km.rating = 2 
+		         		and km.client_account = 'brooklinen' 
+		         		and km.channel = 'chat' 
+		         		and km.kpi = 'missed_chat'
+		         		and metric = 'old')) 
+		       	then 2
+		      	when (target = 0.12) and (daily_team >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		      		where km.rating = 1 
+		      		and km.client_account = 'brooklinen' 
+		      		and km.channel = 'chat' 
+		      		and km.kpi = 'missed_chat'
+		      		and metric = 'old') )
+		        then 1
+				when (target = 0.05) and (daily_team <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+					where km.rating = 5
+					and km.client_account = 'brooklinen'
+					and km.channel = 'chat'
+					and km.kpi = 'missed_chat'
+					and km.metric = 'new'))
+				then 5
+				when (target = 0.05) and (daily_team
+					between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+						where km.rating = 4
+						and km.client_account = 'brooklinen'
+						and km.channel = 'chat'
+						and km.kpi = 'missed_chat'
+						and metric = 'new')
+					and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+						where km.rating = 4 
+						and km.client_account = 'brooklinen' 
+						and km.channel = 'chat' 
+						and km.kpi = 'missed_chat'
+						and metric = 'new'))
+				then 4
+				when (target = 0.05) and (daily_team
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'new') 
+		          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'new') )
+		      	then 3
+		      	when (target = 0.05) and (daily_team
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 2 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'new') 
+		         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		         		where km.rating = 2 
+		         		and km.client_account = 'brooklinen' 
+		         		and km.channel = 'chat' 
+		         		and km.kpi = 'missed_chat'
+		         		and metric = 'new')) 
+		       	then 2
+		      	when (target = 0.05) and (daily_team >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		      		where km.rating = 1 
+		      		and km.client_account = 'brooklinen' 
+		      		and km.channel = 'chat' 
+		      		and km.kpi = 'missed_chat'
+		      		and metric = 'new')) 
+		        then 1        
+			end as rating,
+			weight
+		from raw_score
+)
+,
+final_visor_daily as (
+select 
+	distinct 
+	'brooklinen' as client_account,
+	'daily' as period,
+	local_date_created,
+	'chat' as channel,
+	'' as assignee_id,
+	'' as email_address,	
+	'Team Total' as agent_name,
+	supervisor,
+	'missed_chats_p' as kpi_metric,
+	daily_visor as score,	
+	target,
+	case 
+		when (target=0.12) and (daily_visor <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'chat'
+			and km.kpi = 'missed_chat'
+			and km.metric = 'old'))
+		then 5
+		when (target=0.12) and (daily_visor
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'chat'
+				and km.kpi = 'missed_chat'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'chat' 
+				and km.kpi = 'missed_chat'
+				and metric = 'old'))
+		then 4
+		when (target = 0.12) and (daily_visor
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 0.12) and (daily_visor
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+         		and km.channel = 'chat' 
+         		and km.kpi = 'missed_chat'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 0.12) and (daily_visor >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+      		and km.channel = 'chat' 
+      		and km.kpi = 'missed_chat'
+      		and metric = 'old') )
+        then 1
+		when (target = 0.05) and (daily_visor <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'chat'
+			and km.kpi = 'missed_chat'
+			and km.metric = 'new'))
+		then 5
+		when (target = 0.05) and (daily_visor
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'chat'
+				and km.kpi = 'missed_chat'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'chat' 
+				and km.kpi = 'missed_chat'
+				and metric = 'new'))
+		then 4
+		when (target = 0.05) and (daily_visor
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 0.05) and (daily_visor
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+         		and km.channel = 'chat' 
+         		and km.kpi = 'missed_chat'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 0.05) and (daily_visor >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+      		and km.channel = 'chat' 
+      		and km.kpi = 'missed_chat'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,
+	weight
+from raw_score
+)
+,
+final_weekly as (
+select 
+	distinct 
+	'brooklinen' as client_account,
+	'weekly' as period,
+	week_date as local_date_created,
+	'chat' as channel,
+	'' as assignee_id,
+	email_address,	
+	agent_name,
+	supervisor,
+	'missed_chats_p' as kpi_metric,
+	weekly as score,	
+	target,
+	case 
+		when (target=0.12) and (weekly <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'chat'
+			and km.kpi = 'missed_chat'
+			and km.metric = 'old'))
+		then 5
+		when (target=0.12) and (weekly
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'chat'
+				and km.kpi = 'missed_chat'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'chat' 
+				and km.kpi = 'missed_chat'
+				and metric = 'old'))
+		then 4
+		when (target = 0.12) and (weekly
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 0.12) and (weekly
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+         		and km.channel = 'chat' 
+         		and km.kpi = 'missed_chat'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 0.12) and (weekly >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+      		and km.channel = 'chat' 
+      		and km.kpi = 'missed_chat'
+      		and metric = 'old') )
+        then 1
+		when (target = 0.05) and (weekly <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'chat'
+			and km.kpi = 'missed_chat'
+			and km.metric = 'new'))
+		then 5
+		when (target = 0.05) and (weekly
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'chat'
+				and km.kpi = 'missed_chat'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'chat' 
+				and km.kpi = 'missed_chat'
+				and metric = 'new'))
+		then 4
+		when (target = 0.05) and (weekly
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 0.05) and (weekly
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+         		and km.channel = 'chat' 
+         		and km.kpi = 'missed_chat'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 0.05) and (weekly >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+      		and km.channel = 'chat' 
+      		and km.kpi = 'missed_chat'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,
+	weight
+from raw_score
+)
+,
+final_team_weekly as (
+select
+	distinct 
+	'brooklinen' as client_account,
+	'weekly' as period,
+	week_date as local_date_created,
+	'chat' as channel,
+	'' as assignee_id,
+	'' as email_address,	
+	'Team Total' as agent_name,
+	'Team Total' as supervisor,
+	'missed_chats_p' as kpi_metric,
+	weekly_team as score,	
+	target,
+	case 
+		when (target=0.12) and (weekly_team <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'chat'
+			and km.kpi = 'missed_chat'
+			and km.metric = 'old'))
+		then 5
+		when (target=0.12) and (weekly_team
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'chat'
+				and km.kpi = 'missed_chat'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'chat' 
+				and km.kpi = 'missed_chat'
+				and metric = 'old'))
+		then 4
+		when (target = 0.12) and (weekly_team
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 0.12) and (weekly_team
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+         		and km.channel = 'chat' 
+         		and km.kpi = 'missed_chat'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 0.12) and (weekly_team >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+      		and km.channel = 'chat' 
+      		and km.kpi = 'missed_chat'
+      		and metric = 'old') )
+        then 1
+		when (target = 0.05) and (weekly_team <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'chat'
+			and km.kpi = 'missed_chat'
+			and km.metric = 'new'))
+		then 5
+		when (target = 0.05) and (weekly_team
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'chat'
+				and km.kpi = 'missed_chat'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'chat' 
+				and km.kpi = 'missed_chat'
+				and metric = 'new'))
+		then 4
+		when (target = 0.05) and (weekly_team
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 0.05) and (weekly_team
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+         		and km.channel = 'chat' 
+         		and km.kpi = 'missed_chat'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 0.05) and (weekly_team >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+      		and km.channel = 'chat' 
+      		and km.kpi = 'missed_chat'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,
+	weight
+from raw_score
+)
+,
+final_visor_weekly as (
+select 
+	distinct 
+	'brooklinen' as client_account,
+	'weekly' as period,
+	week_date as local_date_created,
+	'chat' as channel,
+	'' as assignee_id,
+	'' as email_address,	
+	'Team Total' as agent_name,
+	supervisor,
+	'missed_chats_p' as kpi_metric,
+	weekly_visor as score,	
+	target,
+	case 
+		when (target=0.12) and (weekly_visor <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'chat'
+			and km.kpi = 'missed_chat'
+			and km.metric = 'old'))
+		then 5
+		when (target=0.12) and (weekly_visor
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'chat'
+				and km.kpi = 'missed_chat'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'chat' 
+				and km.kpi = 'missed_chat'
+				and metric = 'old'))
+		then 4
+		when (target = 0.12) and (weekly_visor
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 0.12) and (weekly_visor
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+         		and km.channel = 'chat' 
+         		and km.kpi = 'missed_chat'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 0.12) and (weekly_visor >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+      		and km.channel = 'chat' 
+      		and km.kpi = 'missed_chat'
+      		and metric = 'old') )
+        then 1
+		when (target = 0.05) and (weekly_visor <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'chat'
+			and km.kpi = 'missed_chat'
+			and km.metric = 'new'))
+		then 5
+		when (target = 0.05) and (weekly_visor
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'chat'
+				and km.kpi = 'missed_chat'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'chat' 
+				and km.kpi = 'missed_chat'
+				and metric = 'new'))
+		then 4
+		when (target = 0.05) and (weekly_visor
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 0.05) and (weekly_visor
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+         		and km.channel = 'chat' 
+         		and km.kpi = 'missed_chat'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 0.05) and (weekly_visor >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+      		and km.channel = 'chat' 
+      		and km.kpi = 'missed_chat'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,
+	weight
+from raw_score
+)
+--select * from final_monthly
+,
+final_team_monthly as (
+select
+	distinct 
+	'brooklinen' as client_account,
+	'monthly' as period,
+	month_date as local_date_created,
+	'chat' as channel,
+	'' as assignee_id,
+	'' as email_address,	
+	'Team Total' as agent_name,
+	'Team Total' as supervisor,
+	'missed_chats_p' as kpi_metric,
+	monthly_team as score,	
+	target,
+	case 
+		when (target=0.12) and (monthly_team <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'chat'
+			and km.kpi = 'missed_chat'
+			and km.metric = 'old'))
+		then 5
+		when (target=0.12) and (monthly_team
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'chat'
+				and km.kpi = 'missed_chat'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'chat' 
+				and km.kpi = 'missed_chat'
+				and metric = 'old'))
+		then 4
+		when (target = 0.12) and (monthly_team
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 0.12) and (monthly_team
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+         		and km.channel = 'chat' 
+         		and km.kpi = 'missed_chat'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 0.12) and (monthly_team >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+      		and km.channel = 'chat' 
+      		and km.kpi = 'missed_chat'
+      		and metric = 'old') )
+        then 1
+		when (target = 0.05) and (monthly_team <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'chat'
+			and km.kpi = 'missed_chat'
+			and km.metric = 'new'))
+		then 5
+		when (target = 0.05) and (monthly_team
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'chat'
+				and km.kpi = 'missed_chat'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'chat' 
+				and km.kpi = 'missed_chat'
+				and metric = 'new'))
+		then 4
+		when (target = 0.05) and (monthly_team
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 0.05) and (monthly_team
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+          		and km.channel = 'chat' 
+          		and km.kpi = 'missed_chat'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+         		and km.channel = 'chat' 
+         		and km.kpi = 'missed_chat'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 0.05) and (monthly_team >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+      		and km.channel = 'chat' 
+      		and km.kpi = 'missed_chat'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,
+	weight
+from raw_score
+)
+,
+final_visor_monthly as (
+select 
+			distinct 
+			'brooklinen' as client_account,
+			'monthly' as period,
+			month_date as local_date_created,
+			'chat' as channel,
+			'' as assignee_id,
+			'' as email_address,	
+			'Team Total' as agent_name,
+			supervisor,
+			'missed_chats_p' as kpi_metric,
+			monthly_visor as score,	
+			target,
+			case 
+				when (target=0.12) and (monthly_visor <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+					where km.rating = 5
+					and km.client_account = 'brooklinen'
+					and km.channel = 'chat'
+					and km.kpi = 'missed_chat'
+					and km.metric = 'old'))
+				then 5
+				when (target=0.12) and (monthly_visor
+					between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+						where km.rating = 4
+						and km.client_account = 'brooklinen'
+						and km.channel = 'chat'
+						and km.kpi = 'missed_chat'
+						and metric = 'old')
+					and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+						where km.rating = 4 
+						and km.client_account = 'brooklinen' 
+						and km.channel = 'chat' 
+						and km.kpi = 'missed_chat'
+						and metric = 'old'))
+				then 4
+				when (target = 0.12) and (monthly_visor
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'old') 
+		          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'old') )
+		      	then 3
+		      	when (target = 0.12) and (monthly_visor
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 2 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'old') 
+		         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		         		where km.rating = 2 
+		         		and km.client_account = 'brooklinen' 
+		         		and km.channel = 'chat' 
+		         		and km.kpi = 'missed_chat'
+		         		and metric = 'old')) 
+		       	then 2
+		      	when (target = 0.12) and (monthly_visor >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		      		where km.rating = 1 
+		      		and km.client_account = 'brooklinen' 
+		      		and km.channel = 'chat' 
+		      		and km.kpi = 'missed_chat'
+		      		and metric = 'old') )
+		        then 1
+				when (target = 0.05) and (monthly_visor <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+					where km.rating = 5
+					and km.client_account = 'brooklinen'
+					and km.channel = 'chat'
+					and km.kpi = 'missed_chat'
+					and km.metric = 'new'))
+				then 5
+				when (target = 0.05) and (monthly_visor
+					between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+						where km.rating = 4
+						and km.client_account = 'brooklinen'
+						and km.channel = 'chat'
+						and km.kpi = 'missed_chat'
+						and metric = 'new')
+					and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+						where km.rating = 4 
+						and km.client_account = 'brooklinen' 
+						and km.channel = 'chat' 
+						and km.kpi = 'missed_chat'
+						and metric = 'new'))
+				then 4
+				when (target = 0.05) and (monthly_visor
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'new') 
+		          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 3 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'new') )
+		      	then 3
+		      	when (target = 0.05) and (monthly_visor
+		          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		          		where km.rating = 2 
+		          		and km.client_account = 'brooklinen' 
+		          		and km.channel = 'chat' 
+		          		and km.kpi = 'missed_chat'
+		          		and metric = 'new') 
+		         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+		         		where km.rating = 2 
+		         		and km.client_account = 'brooklinen' 
+		         		and km.channel = 'chat' 
+		         		and km.kpi = 'missed_chat'
+		         		and metric = 'new')) 
+		       	then 2
+		      	when (target = 0.05) and (monthly_visor >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+		      		where km.rating = 1 
+		      		and km.client_account = 'brooklinen' 
+		      		and km.channel = 'chat' 
+		      		and km.kpi = 'missed_chat'
+		      		and metric = 'new')) 
+		        then 1        
+			end as rating,
+			weight
+		from raw_score
+)
+select * from sub_null_to_zero
