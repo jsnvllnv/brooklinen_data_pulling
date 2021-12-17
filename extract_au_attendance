@@ -1,0 +1,13 @@
+select 
+	agent_email, 
+	shift_start, 
+	shift_end, 
+	clock_in, 
+	clock_out, 
+	absenteeism, 
+	tardiness 
+from 
+	d_attendance_kpi_summary daks  
+where 
+	client_account = 'brooklinen' 
+	and shift_start >= '2021-08-01'
