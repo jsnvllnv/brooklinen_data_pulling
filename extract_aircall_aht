@@ -1,0 +1,1789 @@
+with agents as (
+select 
+	agent_name,
+	email_address,
+	assignee_id,
+	job_supervisor,
+	job_effectivity_date
+from sd_hris_team_roster shtr 
+left join 
+	(
+		select
+			assignee_id,
+			agent_name,
+			agent_email 
+		from 
+			sd_agent_roster
+		where 
+			client_account = 'brooklinen'
+			and crm_tool = 'aircall'
+	) as ar 
+	on ar.agent_email = shtr.email_address 
+where 
+	job_division = 'Brooklinen'
+		and shtr.email_address is not null
+		and agent_name is not null
+		and assignee_id is not null
+		and profile_status = 'Active'
+)
+,
+call_agents as (
+select 
+	agents.assignee_id,
+	agents.agent_name,
+	email_address,
+	job_supervisor,
+	job_effectivity_date
+from aircall_users
+left join
+	agents
+	on aircall_users.assignee_id = agents.assignee_id 
+where
+	agent_email like ('%boldrimpact%')
+	and email_address is not null
+)
+,
+aht_raw_duplicates as (
+select 
+	call_id,
+	left(user_id,6)::varchar as user_id,
+	agent_name,
+	started_at,
+	email_address,
+	job_supervisor,
+	job_effectivity_date,
+	date_started_local - job_effectivity_date as recent,
+	min(date_started_local - job_effectivity_date) over (partition by call_id, date_started_local, agent_name) as recent_date,
+	date_started_local,
+	time_started_local,
+	direction,
+	duration_total,
+	duration_api,
+	duration_call
+from 
+	aircall_phone_calls
+left join
+	call_agents
+	on (assignee_id = left(user_id,6)::varchar 
+	and date_started_local >= job_effectivity_date
+	)
+where 
+	left(user_id,6)::varchar is not null
+	and direction = 'inbound'
+	and duration_api is not null
+	and agent_name is not null
+)
+,
+remove_duplicates as (
+select
+	distinct 
+	call_id,
+	user_id as assignee_id,
+	agent_name,
+	email_address,
+	job_supervisor,
+	left(started_at::varchar,10)::date as local_date_created,
+	started_at,
+	duration_api
+from 
+	aht_raw_duplicates
+where 
+	recent = recent_date
+)
+,
+check_aircall as (
+select 
+	*,
+	sum(duration_api) over (partition by left(started_at::varchar,10)::date, agent_name) as daily,
+	avg(duration_api) over (partition by left(started_at::varchar,10)::date, agent_name) as avg_daily
+from 
+	remove_duplicates
+order by 
+	started_at
+)
+,
+raw_breakdown as (
+select 
+	distinct 
+	local_date_created,
+	assignee_id,
+	email_address,
+	agent_name,
+	job_supervisor as supervisor,
+	duration_api,
+	daily as sum_daily,
+	avg_daily as daily,
+	avg(duration_api) over (partition by local_date_created) as team_daily,
+	avg(duration_api) over (partition by local_date_created, job_supervisor) as team_visor_daily,
+	date(date_trunc('week', local_date_created)) as week_date,
+	avg(duration_api) over (partition by date(date_trunc('week', local_date_created)), agent_name) as weekly,
+	avg(duration_api) over (partition by date(date_trunc('week', local_date_created))) as team_weekly,
+	avg(duration_api) over (partition by date(date_trunc('week', local_date_created)), job_supervisor) as team_visor_weekly,
+	date(date_trunc('month', local_date_created)) as month_date,
+	avg(duration_api) over (partition by date(date_trunc('month', local_date_created)), agent_name) as monthly,
+	avg(duration_api) over (partition by date(date_trunc('month', local_date_created))) as team_monthly,
+	avg(duration_api) over (partition by date(date_trunc('month', local_date_created)), job_supervisor) as team_visor_monthly
+from check_aircall
+)
+,
+daily_no as (
+select 
+	distinct
+	local_date_created,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	daily as score,
+	case 
+		when local_date_created <= (select (select end_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='old'
+	              			))
+		then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'old'
+				)
+		when local_date_created >= (select (select start_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='new'
+							))
+	    then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'new'
+				)
+	end as target,
+	'' as rating,
+	(select weight 
+				from kpi_data_warehouse.sd_kpi_weights 
+				where client_account = 'brooklinen' 
+				and kpi = 'aht' 
+				and channel = 'voice'
+				and metric = 'all'
+	) as weight
+from 
+	raw_breakdown
+order by
+	local_date_created
+)
+,
+final_daily as (
+select 
+	distinct
+	'brooklinen' as client_account,
+	'daily' as period,
+	local_date_created,
+	'voice' as channel,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	'aht_d' as kpi_metric,
+	score,
+	target,
+	case 
+		when (target=300) and (score < (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 4
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'old'))
+		then 5
+		when (target=300) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old'))
+		then 4
+		when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 300) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'old') )
+        then 1
+		when (target = 240) and (score <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'new'))
+		then 5
+		when (target = 240) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new'))
+		then 4
+		when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 240) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,
+	weight
+from 
+	daily_no
+)
+,
+team_daily_no as (
+select 
+	distinct
+	local_date_created,
+	'' as assignee_id,
+	'' as email_address,
+	'Team Total' as agent_name,
+	'Team Total' as supervisor,
+	team_daily as score,
+	case 
+		when local_date_created <= (select (select end_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='old'
+	              			))
+		then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'old'
+				)
+		when local_date_created >= (select (select start_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='new'
+							))
+	    then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'new'
+				)
+	end as target,
+	'' as rating,
+	(select weight 
+				from kpi_data_warehouse.sd_kpi_weights 
+				where client_account = 'brooklinen' 
+				and kpi = 'aht' 
+				and channel = 'voice'
+				and metric = 'all'
+	) as weight
+from raw_breakdown
+order by
+	local_date_created
+)
+,
+final_team_daily as (
+select 
+	'brooklinen' as client_account,
+	'daily' as period,
+	local_date_created,
+	'voice' as channel,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	'aht_d' as kpi_metric,
+	score,
+	target,
+	case 
+		when (target=300) and (score < (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 4
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'old'))
+		then 5
+		when (target=300) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old'))
+		then 4
+		when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 300) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'old') )
+        then 1
+		when (target = 240) and (score <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'new'))
+		then 5
+		when (target = 240) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new'))
+		then 4
+		when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 240) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,	
+	weight
+from 
+	team_daily_no
+)
+,
+team_visor_daily_no as (
+select 
+	distinct
+	local_date_created,
+	'' as assignee_id,
+	'' as email_address,
+	'Team Total' as agent_name,
+	supervisor,
+	team_visor_daily as score,
+	case 
+		when local_date_created <= (select (select end_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='old'
+	              			))
+		then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'old'
+				)
+		when local_date_created >= (select (select start_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='new'
+							))
+	    then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'new'
+				)
+	end as target,
+	'' as rating,
+	(select weight 
+				from kpi_data_warehouse.sd_kpi_weights 
+				where client_account = 'brooklinen' 
+				and kpi = 'aht' 
+				and channel = 'voice'
+				and metric = 'all'
+	) as weight
+from raw_breakdown
+order by
+	local_date_created
+)
+,
+final_team_visor_daily as (
+select 
+	'brooklinen' as client_account,
+	'daily' as period,
+	local_date_created,
+	'voice' as channel,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	'aht_d' as kpi_metric,	
+	score,
+	target,
+	case 
+		when (target=300) and (score < (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 4
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'old'))
+		then 5
+		when (target=300) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old'))
+		then 4
+		when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 300) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'old') )
+        then 1
+		when (target = 240) and (score <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'new'))
+		then 5
+		when (target = 240) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new'))
+		then 4
+		when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 240) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,	
+	weight
+from 
+	team_visor_daily_no
+)
+,
+weekly_no as (
+select
+	distinct 
+	week_date as local_date_created,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	weekly as score,
+	case 
+		when week_date <= (select (select end_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='old'
+	              			))
+		then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'old'
+				)
+		when week_date >= (select (select start_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='new'
+							))
+	    then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'new'
+				)
+	end as target,
+	'' as rating,
+	(select weight 
+				from kpi_data_warehouse.sd_kpi_weights 
+				where client_account = 'brooklinen' 
+				and kpi = 'aht' 
+				and channel = 'voice'
+				and metric = 'all'
+	) as weight	
+from 
+	raw_breakdown
+)
+,
+final_weekly as (
+select 
+	'brooklinen' as client_account,
+	'weekly' as period,
+	local_date_created,
+	'voice' as channel,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	'aht_d' as kpi_metric,
+	score,
+	target,
+	case 
+		when (target=300) and (score < (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 4
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'old'))
+		then 5
+		when (target=300) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old'))
+		then 4
+		when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 300) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'old') )
+        then 1
+		when (target = 240) and (score <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'new'))
+		then 5
+		when (target = 240) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new'))
+		then 4
+		when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 240) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,
+	weight	
+from 
+	weekly_no
+)
+,
+team_weekly_no as (
+select
+	distinct
+	week_date as local_date_created,
+	'' as assignee_id,
+	'' as email_address,
+	'Team Total' as agent_name,
+	'Team Total' as supervisor,
+	team_weekly as score,
+	case 
+		when week_date <= (select (select end_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='old'
+	              			))
+		then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'old'
+				)
+		when week_date >= (select (select start_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='new'
+							))
+	    then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'new'
+				)
+	end as target,
+	'' as rating,
+	(select weight 
+				from kpi_data_warehouse.sd_kpi_weights 
+				where client_account = 'brooklinen' 
+				and kpi = 'aht' 
+				and channel = 'voice'
+				and metric = 'all'
+	) as weight	
+from
+	raw_breakdown
+)
+,
+final_team_weekly as (
+select 
+	'brooklinen' as client_account,
+	'weekly' as period,
+	local_date_created,
+	'voice' as channel,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	'aht_d' as kpi_metric,
+	score,
+	target,
+	case 
+		when (target=300) and (score < (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 4
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'old'))
+		then 5
+		when (target=300) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old'))
+		then 4
+		when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 300) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'old') )
+        then 1
+		when (target = 240) and (score <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'new'))
+		then 5
+		when (target = 240) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new'))
+		then 4
+		when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 240) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,	
+	weight
+from
+	team_weekly_no
+)
+,
+team_visor_weekly_no as (
+select 
+	distinct
+	week_date as local_date_created,
+	'' as assignee_id,
+	'' as email_address,
+	'Team Total' as agent_name,
+	supervisor,
+	team_visor_weekly as score,
+	case 
+		when week_date <= (select (select end_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='old'
+	              			))
+		then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'old'
+				)
+		when week_date >= (select (select start_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='new'
+							))
+	    then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'new'
+				)
+	end as target,
+	'' as rating,
+	(select weight 
+				from kpi_data_warehouse.sd_kpi_weights 
+				where client_account = 'brooklinen' 
+				and kpi = 'aht' 
+				and channel = 'voice'
+				and metric = 'all'
+	) as weight
+from raw_breakdown
+order by
+	local_date_created
+)
+,
+final_team_visor_weekly as (
+select 
+	'brooklinen' as client_account,
+	'weekly' as period,
+	local_date_created,
+	'voice' as channel,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	'aht_d' as kpi_metric,
+	score,
+	target,
+	case 
+		when (target=300) and (score < (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 4
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'old'))
+		then 5
+		when (target=300) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old'))
+		then 4
+		when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 300) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'old') )
+        then 1
+		when (target = 240) and (score <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'new'))
+		then 5
+		when (target = 240) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new'))
+		then 4
+		when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 240) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,	
+	weight
+from
+	team_visor_weekly_no
+)
+,
+monthly_no as (
+select 
+	distinct
+	month_date as local_date_created,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	monthly as score,
+	case 
+		when month_date <= (select (select end_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='old'
+	              			))
+		then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'old'
+				)
+		when month_date >= (select (select start_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='new'
+							))
+	    then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'new'
+				)
+	end as target,
+	'' as rating,
+	(select weight 
+				from kpi_data_warehouse.sd_kpi_weights 
+				where client_account = 'brooklinen' 
+				and kpi = 'aht' 
+				and channel = 'voice'
+				and metric = 'all'
+	) as weight
+from raw_breakdown
+)
+,
+final_monthly as (
+select 
+	'brooklinen' as client_account,
+	'monthly' as period,
+	local_date_created,
+	'voice' as channel,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	'aht_d' as kpi_metric,
+	score,
+	target,
+	case 
+		when (target=300) and (score < (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 4
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'old'))
+		then 5
+		when (target=300) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old'))
+		then 4
+		when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 300) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'old') )
+        then 1
+		when (target = 240) and (score <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'new'))
+		then 5
+		when (target = 240) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new'))
+		then 4
+		when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 240) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,	
+	weight
+from
+	monthly_no
+)
+,
+team_monthly_no as (
+select 
+	distinct
+	month_date as local_date_created,
+	'' as assignee_id,
+	'' as email_address,
+	'Team Total' as agent_name,
+	'Team Total' as supervisor,
+	team_monthly as score,
+	case 
+		when month_date <= (select (select end_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='old'
+	              			))
+		then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'old'
+				)
+		when month_date >= (select (select start_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='new'
+							))
+	    then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'new'
+				)
+	end as target,
+	'' as rating,
+	(select weight 
+				from kpi_data_warehouse.sd_kpi_weights 
+				where client_account = 'brooklinen' 
+				and kpi = 'aht' 
+				and channel = 'voice'
+				and metric = 'all'
+	) as weight
+from raw_breakdown
+)
+,
+final_team_monthly as (
+select 
+	'brooklinen' as client_account,
+	'monthly' as period,
+	local_date_created,
+	'voice' as channel,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	'aht_d' as kpi_metric,
+	score,
+	target,
+	case 
+		when (target=300) and (score < (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 4
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'old'))
+		then 5
+		when (target=300) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old'))
+		then 4
+		when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 300) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'old') )
+        then 1
+		when (target = 240) and (score <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'new'))
+		then 5
+		when (target = 240) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new'))
+		then 4
+		when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 240) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,		
+	weight
+from 
+	team_monthly_no
+)
+,
+team_visor_monthly_no as (
+select 
+	distinct
+	month_date as local_date_created,
+	'' as assignee_id,
+	'' as email_address,
+	'Team Total' as agent_name,
+	supervisor,
+	team_visor_monthly as score,
+	case 
+		when month_date <= (select (select end_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='old'
+	              			))
+		then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'old'
+				)
+		when month_date >= (select (select start_date 
+							from kpi_data_warehouse.sd_performance_target 
+							where client_account = 'brooklinen'
+	              			and channel = 'voice' 
+	              			and kpi = 'aht'
+	              			and metric='new'
+							))
+	    then (select target 
+				from kpi_data_warehouse.sd_performance_target 
+				where client_account = 'brooklinen' 
+      			and channel = 'voice' 
+      			and kpi = 'aht'
+				and metric = 'new'
+				)
+	end as target,
+	'' as rating,
+	(select weight 
+				from kpi_data_warehouse.sd_kpi_weights 
+				where client_account = 'brooklinen' 
+				and kpi = 'aht' 
+				and channel = 'voice'
+				and metric = 'all'
+	) as weight
+from raw_breakdown
+)
+,
+final_team_visor_monthly as (
+select 
+	'brooklinen' as client_account,
+	'monthly' as period,
+	local_date_created,
+	'voice' as channel,
+	assignee_id,
+	email_address,
+	agent_name,
+	supervisor,
+	'aht_d' as kpi_metric,
+	score,
+	target,
+	case 
+		when (target=300) and (score < (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 4
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'old'))
+		then 5
+		when (target=300) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'old'))
+		then 4
+		when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') )
+      	then 3
+      	when (target = 300) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'old') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'old')) 
+       	then 2
+      	when (target = 300) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'old') )
+        then 1
+		when (target = 240) and (score <= (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km
+			where km.rating = 5
+			and km.client_account = 'brooklinen'
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+			and km.metric = 'new'))
+		then 5
+		when (target = 240) and (score
+			between (select km.base from kpi_data_warehouse.sd_kpi_metrics km
+				where km.rating = 4
+				and km.client_account = 'brooklinen'
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new')
+			and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+				where km.rating = 4 
+				and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+				and metric = 'new'))
+		then 4
+		when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+          	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 3 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') )
+      	then 3
+      	when (target = 240) and (score
+          	between (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+          		where km.rating = 2 
+          		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+          		and metric = 'new') 
+         	and (select km.ceiling from kpi_data_warehouse.sd_kpi_metrics km 
+         		where km.rating = 2 
+         		and km.client_account = 'brooklinen' 
+				and km.channel = 'voice'
+				and km.kpi = 'aht'
+         		and metric = 'new')) 
+       	then 2
+      	when (target = 240) and (score >= (select km.base from kpi_data_warehouse.sd_kpi_metrics km 
+      		where km.rating = 1 
+      		and km.client_account = 'brooklinen' 
+			and km.channel = 'voice'
+			and km.kpi = 'aht'
+      		and metric = 'new')) 
+        then 1        
+	end as rating,	
+	weight
+from 
+	team_visor_monthly_no
+)
+select  
+	local_date_created,
+	extract(hour from started_at) as hour_started,
+	agent_name,
+	duration_api
+from check_aircall
+where 
+	local_date_created >= '2021-12-06' 
+	and local_date_created < '2021-12-13'
+order by 
+	started_at,
+	agent_name
