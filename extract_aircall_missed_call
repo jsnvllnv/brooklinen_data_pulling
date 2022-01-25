@@ -1259,3 +1259,4 @@ select
 	total_inbound_calls,
 	total_mc
 from extract_scorecard
+where period_ >= '2022-01-01'
