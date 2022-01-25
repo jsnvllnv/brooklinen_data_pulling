@@ -5,7 +5,7 @@ from
 where 
 	client_account in ('brooklinen')
 	and employee_email like '%boldrimpact%' 
-	and request_sent_at_date >= '2021-01-01'
+	and request_sent_at_date >= '2022-01-01'
 order by 
 	request_sent_at_date,
 	request_sent_at_utc_time 
