@@ -1,13 +1,13 @@
 select 
 	agent_email, 
-	shift_start, 
-	shift_end, 
-	clock_in, 
-	clock_out, 
-	absenteeism, 
-	tardiness 
+	to_char(shift_start,'mm/dd/yyyy hh:mi:ss') as shift_start, 
+	to_char(shift_end,'mm/dd/yyyy hh:mi:ss') as shift_end, 
+	to_char(clock_in,'mm/dd/yyyy hh:mi:ss') as clock_in, 
+	to_char(clock_out,'mm/dd/yyyy hh:mi:ss') as clock_out, 
+	absenteeism::varchar, 
+	tardiness::varchar 
 from 
 	d_attendance_kpi_summary daks  
 where 
-	client_account = 'brooklinen' 
-	and shift_start >= '2021-08-01'
+	client_account = 'brooklinen'  
+	and shift_start >= '2021-07-01'
