@@ -1,9 +1,9 @@
 select 
 	daks.agent_name, 
-	to_char(shift_start,'mm/dd/yyyy hh:mi:ss') as shift_start, 
-	to_char(shift_end,'mm/dd/yyyy hh:mi:ss') as shift_end, 
-	to_char(clock_in,'mm/dd/yyyy hh:mi:ss') as clock_in, 
-	to_char(clock_out,'mm/dd/yyyy hh:mi:ss') as clock_out, 
+	to_char(shift_start,'mm/dd/yyyy hh24:mi:ss') as shift_start, 
+	to_char(shift_end,'mm/dd/yyyy hh24:mi:ss') as shift_end, 
+	to_char(clock_in,'mm/dd/yyyy hh24:mi:ss') as clock_in, 
+	to_char(clock_out,'mm/dd/yyyy hh24:mi:ss') as clock_out, 
 	absenteeism::varchar, 
 	tardiness::varchar 
 from 
