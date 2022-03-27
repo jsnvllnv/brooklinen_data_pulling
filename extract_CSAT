@@ -1,5 +1,24 @@
 select 
-	*  
+	id,
+	client_account,
+	request_id,
+	ext_interaction_id,
+	channel,
+	star_rating,
+	employee_first_name,
+	employee_last_name,
+	employee_email,
+	team_leader,
+	customer_name,
+	customer_email,
+	reward,
+	comments,
+	areas_for_improvement,
+	tags,
+	to_char(request_sent_at_date::date,'mm/dd/yyyy') as request_sent_at_date,
+	request_sent_at_utc_time,
+	to_char(response_received_at_date::date,'mm/dd/yyyy') as  response_received_at_date,
+	timestamp
 from 
 	kpi_data_warehouse.stellaconnect_responses 
 where 
@@ -8,4 +27,4 @@ where
 	and request_sent_at_date >= '2022-01-01'
 order by 
 	request_sent_at_date,
-	request_sent_at_utc_time 
+	request_sent_at_utc_time  
