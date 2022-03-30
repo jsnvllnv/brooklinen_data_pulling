@@ -1,6 +1,7 @@
 select 
-	id,
-	client_account,
+	distinct 
+	stellaconnect_responses.id,
+	stellaconnect_responses.client_account,
 	request_id,
 	ext_interaction_id,
 	channel,
@@ -18,11 +19,13 @@ select
 	to_char(request_sent_at_date::date,'mm/dd/yyyy') as request_sent_at_date,
 	request_sent_at_utc_time,
 	to_char(response_received_at_date::date,'mm/dd/yyyy') as  response_received_at_date,
-	timestamp
+	stellaconnect_responses.timestamp,
+	agent_name
 from 
-	kpi_data_warehouse.stellaconnect_responses 
+	stellaconnect_responses
+left join sd_agent_roster sar on employee_email = agent_email
 where 
-	client_account in ('brooklinen')
+	stellaconnect_responses.client_account in ('brooklinen')
 	and employee_email like '%boldrimpact%' 
 	and request_sent_at_date >= '2022-01-01'
 order by 
