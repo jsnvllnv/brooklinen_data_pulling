@@ -1,13 +1,18 @@
-select 
+select
+	agent_name,
 	agent_email, 
+	supervisor,
+	to_char(shift_start,'mm/dd/yyyy') as local_date, 
 	to_char(shift_start,'mm/dd/yyyy hh24:mi:ss') as shift_start, 
 	to_char(shift_end,'mm/dd/yyyy hh24:mi:ss') as shift_end, 
 	to_char(clock_in,'mm/dd/yyyy hh24:mi:ss') as clock_in, 
 	to_char(clock_out,'mm/dd/yyyy hh24:mi:ss') as clock_out, 
 	absenteeism::varchar, 
-	tardiness::varchar 
+	tardiness::varchar
 from 
 	d_attendance_kpi_summary daks  
+left join (select distinct agent_email as email_ from sd_agent_roster where client_account = 'brooklinen') sar on sar.email_ = agent_email 
 where 
-	client_account = 'brooklinen'  
-	and shift_start >= '2021-07-01'
+	client_account = 'brooklinen'
+order by shift_start::date desc
+limit 10000
