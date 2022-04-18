@@ -28,6 +28,6 @@ where
 	stellaconnect_responses.client_account in ('brooklinen')
 	and employee_email like '%boldrimpact%' 
 order by 
-	request_sent_at_date desc,
+	timestamp desc,
 	request_sent_at_utc_time
 limit 10000
