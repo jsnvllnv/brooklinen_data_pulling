@@ -9,7 +9,8 @@ select
 		cx_name 
 from 
 	(
-		select 
+		select
+				distinct 
 				local_date_created,
 				agent_name as assignee_id,
 				email_address,
