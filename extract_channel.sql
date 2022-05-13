@@ -143,3 +143,4 @@ select
 				order by start_date desc, agent_name)
 			) as all_
 	order by start_date::date desc
+	limit 20000
