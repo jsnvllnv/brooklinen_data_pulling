@@ -13,7 +13,7 @@ select
 				direction,
 				duration_total,
 				duration_api,
-				duration_call,
+				duration_call, 
 				user_name,
 				user_email,
 				agent_name,
@@ -31,3 +31,4 @@ select
 					and missed_call_reason is null) as aircall_raw
 	where agent_name is not null
 	order by started_at desc
+	limit 10000
