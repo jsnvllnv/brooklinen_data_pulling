@@ -11,7 +11,7 @@ select
 	tardiness::varchar
 from 
 	d_attendance_kpi_summary daks  
-left join (select distinct agent_email as email_ from sd_agent_roster where client_account = 'brooklinen') sar on sar.email_ = agent_email 
+left join (select distinct agent_email as email_ from sd_client_agent_roster where client_account = 'brooklinen') sar on sar.email_ = agent_email 
 where 
 	client_account = 'brooklinen'
 order by shift_start::date desc
