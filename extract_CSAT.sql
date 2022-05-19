@@ -23,7 +23,7 @@ select
 	agent_name
 from 
 	stellaconnect_responses
-left join sd_agent_roster sar on employee_email = agent_email
+left join sd_client_agent_roster sar on employee_email = agent_email
 where 
 	stellaconnect_responses.client_account in ('brooklinen')
 	and employee_email like '%boldrimpact%' 
