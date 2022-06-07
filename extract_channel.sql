@@ -31,7 +31,7 @@ select
 									from 
 										sd_utilization su 
 									where 
-										division_name = 'Brooklinen'
+										(division_account like '%Brooklinen%')
 										and (activity = 'Chat' or activity = 'Email' or activity = 'Voice')
 									order by 
 										start_date,agent_name,activity ) as au ) as daily_group
@@ -84,7 +84,7 @@ select
 															from 
 																sd_utilization su 
 															where 
-																division_name = 'Brooklinen'
+																(division_account like '%Brooklinen%')
 																and (activity = 'Chat' or activity = 'Email' or activity = 'Voice')
 															order by 
 																start_date,agent_name,activity ) as au ) as daily_group ) as c_length ) as final_channel_m
@@ -136,7 +136,7 @@ select
 															from 
 																sd_utilization su 
 															where 
-																division_name like '%Brooklinen%'
+																(division_account like '%Brooklinen%')
 																and (activity = 'Chat' or activity = 'Email' or activity = 'Voice')
 															order by 
 																start_date,agent_name,activity ) as au ) as daily_group ) as c_length ) as final_channel_m
